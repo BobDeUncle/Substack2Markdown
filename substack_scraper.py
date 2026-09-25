@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import glob
 from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -915,15 +916,25 @@ class BaseSubstackScraper(ABC):
             file.write(html_content)
 
     @staticmethod
-    def get_filename_from_url(url: str, filetype: str = ".md") -> str:
-        """Gets the filename from the URL."""
+    def slugify(text: str) -> str:
+        """Converts text into a filename-safe slug, e.g. 'Freya India' -> 'freya-india'."""
+        slug = text.lower().strip()
+        slug = re.sub(r'[^a-z0-9]+', '-', slug)
+        return slug.strip('-')
+
+    @staticmethod
+    def get_filename_from_url(url: str, filetype: str = ".md", author: str = "") -> str:
+        """Gets the filename from the URL, optionally prefixed with the author slug."""
         if not isinstance(url, str):
             raise ValueError("url must be a string")
         if not isinstance(filetype, str):
             raise ValueError("filetype must be a string")
         if not filetype.startswith("."):
             filetype = f".{filetype}"
-        return url.split("/")[-1] + filetype
+        slug = url.split("/")[-1]
+        if author:
+            slug = f"{BaseSubstackScraper.slugify(author)}-{slug}"
+        return slug + filetype
 
     @staticmethod
     def combine_metadata_and_content(
@@ -1095,57 +1106,63 @@ class BaseSubstackScraper(ABC):
         with tqdm(total=total, desc="Scraping posts") as pbar:
             for url in self.post_urls:
                 try:
-                    md_filename = self.get_filename_from_url(url, filetype=".md")
-                    html_filename = self.get_filename_from_url(url, filetype=".html")
+                    url_slug = url.split("/")[-1]
+                    existing_md = glob.glob(os.path.join(self.md_save_dir, f"*{url_slug}.md"))
+                    if existing_md:
+                        pbar.write(f"File already exists: {existing_md[0]}")
+                        count += 1
+                        pbar.update(1)
+                        if num_posts_to_scrape != 0 and count == num_posts_to_scrape:
+                            break
+                        continue
+
+                    soup = self.get_url_soup(url)
+                    if soup is None:
+                        total += 1
+                        pbar.total = total
+                        pbar.refresh()
+                        continue
+
+                    title, subtitle, author, date, cover_image, like_count, md = self.extract_post_data(soup, url)
+
+                    content_element = soup.select_one("div.available-content")
+                    if title == "Untitled" or content_element is None:
+                        pbar.write(f"[SKIP] Extraction failed for {url} (title={title!r}, content_present={content_element is not None}). See _debug dump.")
+                        count += 1
+                        pbar.update(1)
+                        if num_posts_to_scrape != 0 and count == num_posts_to_scrape:
+                            break
+                        continue
+
+                    md_filename = self.get_filename_from_url(url, filetype=".md", author=author)
+                    html_filename = self.get_filename_from_url(url, filetype=".html", author=author)
                     md_filepath = os.path.join(self.md_save_dir, md_filename)
                     html_filepath = os.path.join(self.html_save_dir, html_filename)
 
-                    if not os.path.exists(md_filepath):
-                        soup = self.get_url_soup(url)
-                        if soup is None:
-                            total += 1
-                            pbar.total = total
-                            pbar.refresh()
-                            continue
+                    if self.download_images:
+                        total_images = count_images_in_markdown(md)
+                        slug = get_post_slug(url) if is_post_url(url) else url.rstrip('/').split('/')[-1]
+                        with tqdm(
+                            total=total_images,
+                            desc=f"Downloading images for {slug}",
+                            leave=False,
+                        ) as img_pbar:
+                            md = process_markdown_images(md, self.writer_name, slug, img_pbar)
 
-                        title, subtitle, author, date, cover_image, like_count, md = self.extract_post_data(soup, url)
+                    self.save_to_file(md_filepath, md)
+                    html_content = self.md_to_html(md)
+                    self.save_to_html_file(html_filepath, html_content)
 
-                        # Skip writing if extraction clearly failed — leaves no stale file so reruns retry.
-                        content_element = soup.select_one("div.available-content")
-                        if title == "Untitled" or content_element is None:
-                            pbar.write(f"[SKIP] Extraction failed for {url} (title={title!r}, content_present={content_element is not None}). See _debug dump.")
-                            count += 1
-                            pbar.update(1)
-                            if num_posts_to_scrape != 0 and count == num_posts_to_scrape:
-                                break
-                            continue
-
-                        if self.download_images:
-                            total_images = count_images_in_markdown(md)
-                            slug = get_post_slug(url) if is_post_url(url) else url.rstrip('/').split('/')[-1]
-                            with tqdm(
-                                total=total_images,
-                                desc=f"Downloading images for {slug}",
-                                leave=False,
-                            ) as img_pbar:
-                                md = process_markdown_images(md, self.writer_name, slug, img_pbar)
-
-                        self.save_to_file(md_filepath, md)
-                        html_content = self.md_to_html(md)
-                        self.save_to_html_file(html_filepath, html_content)
-
-                        essays_data.append({
-                            "title": title,
-                            "subtitle": subtitle,
-                            "author": author,
-                            "date": date,
-                            "cover_image": cover_image,
-                            "like_count": like_count,
-                            "file_link": md_filepath,
-                            "html_link": html_filepath
-                        })
-                    else:
-                        pbar.write(f"File already exists: {md_filepath}")
+                    essays_data.append({
+                        "title": title,
+                        "subtitle": subtitle,
+                        "author": author,
+                        "date": date,
+                        "cover_image": cover_image,
+                        "like_count": like_count,
+                        "file_link": md_filepath,
+                        "html_link": html_filepath
+                    })
                 except Exception as e:
                     pbar.write(f"Error scraping post: {e}")
 
